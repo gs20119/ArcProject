@@ -4,7 +4,7 @@ from trl import SFTTrainer, SFTConfig
 from typing import List
 import numpy as np
 
-from .prompt import *
+from .prompt_new import *
 from transformers import BitsAndBytesConfig, AutoModelForCausalLM, AutoTokenizer
 from peft import get_peft_model, LoraConfig, TaskType, PeftModel
 from datasets import Dataset
@@ -37,19 +37,11 @@ class ARCSolver:
         self.model = None
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, token=hf_token)
         self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        self.color_map = {
-            0: "black", 1: "red", 2: "green", 3: "yellow", 4: "blue",
-            5: "magenta", 6: "cyan", 7: "white", 8: "purple", 9: "orange",
-        }
-        self.color_map_inv = {
-            "black": 0, "red": 1, "green": 2, "yellow": 3, "blue": 4,
-            "magenta": 5, "cyan": 6, "white": 7, "purple": 8, "orange": 9,
-        }
-
-        self.system_header = "<|im_start|>system\n"
-        self.user_header = "<|im_start|>user\n"
-        self.assist_header = "<|im_start|>assistant\n"
+        
+        self.system_header = self.tokenizer.encode("<|im_start|>system\n", add_special_tokens=False)
+        self.user_header = self.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
+        self.assist_header = self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+        self.end_tail = self.tokenizer.encode("<|im_end|>\n", add_special_tokens=False)
         
         self.rng = np.random.default_rng(24)
         
@@ -61,73 +53,48 @@ class ARCSolver:
 
 
     def parse_grid(self, ids: List[int]):
-        from ast import literal_eval
-        text = self.tokenizer.decode(ids).split("\n")
-        
-        for line in text[::-1]:
-            if "rest" not in line: continue
-            words = line.split(" ")
-            if words[1] in self.color_map_inv:
-                self.base_color = self.color_map_inv[words[1]]
-            break
+        """
+        Parse LLM generated sequence into ARC grid format
 
-        width, height = 1, 1
-        grid = None
-        for line in text[1:-1]:
-            if " " not in line: continue
-            words = line.split(" ")
-            if "width" in line and "height" in line:
-                width = int(words[6][:-1])
-                height = int(words[11][:-1])
-            if "[" not in line: continue
-            if grid is None: 
-                grid = np.full((height, width), self.base_color).astype(int)
-            count = int(words[0])
-            color = words[1]
-            if color not in self.color_map_inv: continue 
-            try: 
-                coord = ' '.join(words[5:5+count])
-                coord = literal_eval(coord[:-1])
-            except: continue
-            for x, y in coord: 
-                if 0 < x and x <= height and 0 < y and y <= width:
-                    grid[x-1,y-1] = self.color_map_inv[color]
+        Args:
+            ids (List[int]): LLM generated token list
+
+        Returns:
+            grid (List[List[int]]): parsed 2D grid
+        """
+        grid = []
+        row = []
+        inv_map = {k: i for i, k in enumerate(self.pixel_ids)}
         
-        if grid is None:
-            grid = np.full((height, width), self.base_color).astype(int)
+        for idx in ids:
+            if idx == self.sep:
+                if len(row) > 0:
+                    grid.append(row.copy())
+                    row.clear()
+            else:
+                if idx not in inv_map: continue
+                row.append(inv_map.get(idx, 0))
         return grid
     
-    def text_grid(self, grid: np.ndarray):
-        coord_map = dict()
-        for c in range(10): coord_map[c] = []
-        height = len(grid)
-        for i, row in enumerate(grid):
-            width = len(row)
-            for j, col in enumerate(row):
-                coord_map[col].append((i,j))
-        if self.base_color is None:
-            col_count = [ len(values) for i, values in coord_map.items() ]
-            self.base_color = np.argmax(col_count)
+    def format_grid(self, grid):
+        """
+        Format 2D grid into LLM input tokens
+
+        Args:
+            grid (List[List[int]]): 2D grid
+
+        Returns:
+            ids (List[int]): Token list for LLM
+        """
+        ids = []
         
-        text = f"The grid has a width of {width}, and a height of {height}.\n"
-        text += f"So, there are total {width*height} pixels in the grid, colored:\n"
-        # text = "width: " + str(width) + "\nheight: " + str(height) + "\n"
-        for i, values in coord_map.items():
-            if not values: continue
-            if i == self.base_color: continue
-            count = len(values)
-            # text += self.color_map[i] + ": ["
-            text += f"{count} {self.color_map[i]} pixels on coordinates ["
-            for coord in values:
-                x, y = coord
-                text += "(" + str(x+1) + "," + str(y+1) + "), "
-            text = text[:-2]
-            # text += "]\n"
-            text += f"],\n"
-        text += f"{len(coord_map[self.base_color])} {self.color_map[self.base_color]} pixels on the rest.\n"
-        return text
+        for row in grid:
+            for col in row:
+                ids.append(self.pixel_ids[col])
+            ids.append(self.sep)
+        return ids
     
-    def text_prompt(self, datapoint, train=False, reasoning=False):
+    def prompt_id(self, datapoint, train=False, reasoning=False):
         """
         datapoint (dict): 
             contains training data, test input
@@ -145,42 +112,30 @@ class ARCSolver:
             if self.flip != 2: grid = np.flip(grid, axis=self.flip)
             return grid
 
-        sys = system_message
-        user = user_message_template1 + "\n"
-        input_head = "input:\n"
-        output_head = "output for the given input:\n"
+        sys = self.system_header + self.tokenizer.encode(system_message+"\n", add_special_tokens=False) + self.end_tail
+        user = self.user_header + self.tokenizer.encode(user_message_template1+"\n", add_special_tokens=False)
+        input_head = self.tokenizer.encode("input:\n", add_special_tokens=False)
+        output_head = self.tokenizer.encode("output:\n", add_special_tokens=False)
         for ex in training_data:
             input = transform(ex['input'])
-            output = transform(ex['output'])          
-            self.base_color = None
-            user += input_head + self.text_grid(input)
-            user += output_head + self.text_grid(output) + "\n"
+            output = transform(ex['output'])       
+            user += input_head + self.format_grid(input)
+            user += output_head + self.format_grid(output) + [self.sep]
+        
 
         test_data = datapoint['test'][0]
         input_test_data = transform(test_data['input'])
-        output_test_data = transform(test_data['output'])
-        user += user_message_template2 + "\n"
-        self.base_color = None
-        user += input_head + self.text_grid(input_test_data) + "\n"
-        user += user_message_template3 + "\n"
-
-        assist = output_head + self.text_grid(output_test_data) + "\n"
-
-        messages = [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": user},
-            {"role": "assistant", "content": assist}
-        ]
-        if not train: messages = messages[:2]
-        prompt = self.tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False,
-            add_generation_prompt=(not train),
-            enable_thinking=reasoning
-        )
-        if not reasoning:
-            prompt = prompt.replace("<think>\n\n","").replace("</think>\n\n","")
-        return prompt
+        
+        user += self.tokenizer.encode("\n"+user_message_template2+"\n", add_special_tokens=False)
+        user += input_head + self.format_grid(input_test_data)
+        user += self.tokenizer.encode("\n"+user_message_template3+"\n", add_special_tokens=False) + self.end_tail
+        
+        assist = self.assist_header.copy()
+        if train:
+            output_test_data = transform(test_data['output'])
+            assist += output_head + self.format_grid(output_test_data)
+        prompt = sys + user + assist
+        return {"input_ids": prompt}
 
 
     def preprocess_data(self, train_dataset):
@@ -189,27 +144,23 @@ class ARCSolver:
         format_data = []
         token_lens = []
         for train_data in train_dataset:
-            prompt = self.text_prompt(train_data, train=True)
-            tokenized = self.tokenizer(
+            prompt = self.prompt_id(train_data, train=True)
+            tokenized = self.tokenizer.pad(
                 prompt, 
                 return_tensors="pt",
                 padding="max_length",
-                max_length=2048,
-                truncation=True
+                max_length=1024
             )
             input_ids = tokenized.input_ids.squeeze()
             attn_mask = tokenized.attention_mask.squeeze()
-            header_ids = self.tokenizer(self.assist_header, add_special_tokens=False)["input_ids"]
-            print(self.tokenizer.decode(tokenized["input_ids"][0]))
-            print(self.tokenizer.decode(header_ids))
-            assert False
+            header_ids = self.assist_header #self.tokenizer(self.assist_header, add_special_tokens=False)["input_ids"]
+            #print(self.tokenizer.decode(header_ids))
 
             input_ids_list = input_ids.tolist()
             num_tokens = attn_mask.sum().item()
             token_lens.append(num_tokens)
             if num_tokens >= len(input_ids_list): continue # truncate long sequences
             
-
             header_len = len(header_ids)
             found = False
             for i in range(len(input_ids_list) - header_len+1):
@@ -241,8 +192,8 @@ class ARCSolver:
         """
         # example
         datapoint = train_dataset[0]
-        prompt = self.text_prompt(datapoint, train=True)
-        print(prompt)
+        prompt = self.prompt_id(datapoint, train=True)
+        # print(prompt)
 
         # generate and encode prompts 
         dataset = self.preprocess_data(train_dataset)
@@ -320,24 +271,25 @@ class ARCSolver:
         A single example of test data is given.
         You should predict 2D grid (List[List[int]] or np.ndarray)
         """
-        prompt = self.text_prompt(datapoint)
-        tokenized = self.tokenizer(
-            prompt, 
-            return_tensors="pt",
-            padding="max_length",
-            max_length=4096,
-            truncation=True
-        )
+        prompt = self.prompt_id(datapoint)
+        # tokenized = self.tokenizer.pad(
+        #     prompt, 
+        #     return_tensors="pt",
+        #     padding="max_length",
+        #     max_length=2048,
+        # )
+        
 
-        input_ids = tokenized.input_ids.squeeze().to(self.device)
-        header_ids = self.tokenizer(self.assist_header, add_special_tokens=False)["input_ids"]
+        input_ids = torch.tensor(prompt["input_ids"]).to(self.device) # tokenized.input_ids.squeeze().to(self.device)
+        header_ids = self.assist_header # self.tokenizer(self.assist_header, add_special_tokens=False)["input_ids"]
         header_str = self.tokenizer.decode(header_ids)
         prompt_str = self.tokenizer.decode(input_ids.tolist())
-        # print(prompt_str) # please check if max_length is appropriate.
+        print(prompt_str) # please check if max_length is appropriate.
         
-        label_idx = prompt_str.find(header_str) + len(header_str)
-        label_idx = len(self.tokenizer(prompt_str[:label_idx], add_special_tokens=False)["input_ids"])
-        input_ids = input_ids[:label_idx].unsqueeze(0)
+        # label_idx = prompt_str.find(header_str) + len(header_str)
+        # label_idx = len(self.tokenizer(prompt_str[:label_idx], add_special_tokens=False)["input_ids"])
+        # input_ids = input_ids[:label_idx].unsqueeze(0)
+        input_ids = input_ids.unsqueeze(0)
 
         config = GenerationConfig(
             do_sample=False,
@@ -356,22 +308,24 @@ class ARCSolver:
         N_prompt = input_ids.numel()
 
         output = output[N_prompt:].tolist()
-        # print(self.tokenizer.decode(output))
+        print(self.tokenizer.decode(output))
 
         # Parse the output
-        try: grid = self.parse_grid(output)
-        except: grid = np.array((1,1))
-
-        # Inverse transformation
-        inv_permu = np.empty_like(self.color_permu)
-        inv_permu[self.color_permu] = np.arange(10)
-        grid = inv_permu[grid]
-        if self.flip != 2: 
-            grid = np.flip(grid, axis=self.flip)
-        # print(grid, self.rot)
-        grid = np.rot90(grid, -self.rot)
+        # try: 
+        print(self.parse_grid(output))
+        try: 
+            grid = np.array(self.parse_grid(output))
+            # Inverse transformation
+            inv_permu = np.empty_like(self.color_permu)
+            inv_permu[self.color_permu] = np.arange(10)
+            grid = inv_permu[grid]
+            if self.flip != 2: 
+                grid = np.flip(grid, axis=self.flip)
+            # print(grid, self.rot)
+            grid = np.rot90(grid, -self.rot)
+        except: grid = np.zeros((3,3))
         
-        # print(grid)
+        print(grid)
         return grid
 
 

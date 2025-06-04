@@ -40,13 +40,13 @@ def load_data(base_dir):
     return dataset, task_names
 
 
-def sample_data(dataset, tasks, n_row=10000, n_example=3, indices=list(range(300))):
+def sample_data(dataset, tasks, n_row=10000, n_example=3, indices=list(range(300)), random=42):
     #####################################################################
     # each element of the dataset is a list of cases in a single task
     # n_row: num of total rows. MAX ~ 260000
     # indices: list of indices of selected tasks. subset of range(300)
     #####################################################################
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(random)
     N_DATA, N_TASK = n_row, len(indices)
 
     data = []

@@ -8,15 +8,15 @@ import torch
 from transformers import set_seed
 from datasets import load_dataset
 from evaluate import *
-from arc import ARCSolver
+from arc.arc_new import ARCSolver
 
 from datasets import Dataset
 from utils import render_grid
 
 # prepare the test dataset
-data_path = "dataset"
+data_path = "/workspace/dataset"
 dataset, task_list = load_data(data_path)
-df = sample_data(dataset, task_list, n_row=10000) 
+df300 = sample_data(dataset, task_list, n_row=30000) 
 
 # prepare samples for each task
 task_samples = []
@@ -24,14 +24,32 @@ for t in range(300):
     df = sample_data(dataset, task_list, n_row=1000, indices=[t])
     task_samples.append(df)
 
+simple_tasks = []
+hard_tasks = []
+for task_idx in range(300):
+    check = True
+    for data in Dataset.from_pandas(task_samples[task_idx]).shuffle().select(range(3)):
+        for case in data['train']:
+            wi, hi = len(case['input'][0]), len(case['input'])
+            wo, ho = len(case['output'][0]), len(case['output'])
+            if (wi!=wo) or (hi!=ho): check = False
+        case = data['test'][0]
+        wi, hi = len(case['input'][0]), len(case['input'])
+        wo, ho = len(case['output'][0]), len(case['output'])
+        if (wi!=wo) or (hi!=ho): check = False
+    if check: simple_tasks.append(task_idx)
+    else: hard_tasks.append(task_idx)
+print(hard_tasks)
+
 # load our model(arcsolver) instance
 set_seed(1234567890)
 token = os.environ.get("HF_TOKEN", None)
-solver = ARCSolver(model_id="Qwen/Qwen3-4B", token=token)
+solver = ARCSolver(model_id="Qwen/Qwen3-4B", hf_token=token)
 
 # prepare train and then train
 solver.prepare_train()
-n_train = 10000
-df20 = sample_data(dataset, task_list, n_row=10500, indices=list(range(20)))
-train_dataset = Dataset.from_pandas(df20).select(range(n_train))
-solver.train(train_dataset)
+n_train = len(hard_tasks)*700
+n_eval = 500
+dfsimple = sample_data(dataset, task_list, n_row=n_train+n_eval, indices=hard_tasks, random=24)
+train_dataset = Dataset.from_pandas(dfsimple).select(range(n_train))
+solver.train(train_dataset, checkpoint=None)
