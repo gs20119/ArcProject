@@ -25,7 +25,9 @@ class ARCSolver:
         self.config_path = "artifacts/config/config.yml"
         self.model_id = model_id
         self.hf_token = hf_token
-        self.accelerator = Accelerator()
+        self.accelerator = Accelerator(kwargs_handlers = [InitProcessGroupKwargs(timeout=datetime.timedelta(seconds=5400))])
+        if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
+            modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none","colwise",'rowwise']
 
         # Configure the BitsAndBytes settings for 4-bit quantization to reduce memory usage
         self.bnb_config = BitsAndBytesConfig(

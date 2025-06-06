@@ -10,7 +10,8 @@ from peft import get_peft_model, LoraConfig, TaskType, PeftModel
 from datasets import Dataset
 import datetime
 
-from accelerate import Accelerator, PartialState
+from accelerate import Accelerator, PartialState, InitProcessGroupKwargs
+from transformers import modeling_utils
 
 class ARCSolver:
     """
@@ -25,7 +26,9 @@ class ARCSolver:
         self.config_path = "artifacts/config/config.yml"
         self.model_id = model_id
         self.hf_token = hf_token
-        self.accelerator = Accelerator()
+        self.accelerator = Accelerator(kwargs_handlers = [InitProcessGroupKwargs(timeout=datetime.timedelta(seconds=5400))])
+        if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
+            modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none","colwise",'rowwise']
 
         # Configure the BitsAndBytes settings for 4-bit quantization to reduce memory usage
         self.bnb_config = BitsAndBytesConfig(
@@ -200,9 +203,8 @@ class ARCSolver:
             input_ids = tokenized.input_ids.squeeze()
             attn_mask = tokenized.attention_mask.squeeze()
             header_ids = self.tokenizer(self.assist_header, add_special_tokens=False)["input_ids"]
-            print(self.tokenizer.decode(tokenized["input_ids"][0]))
-            print(self.tokenizer.decode(header_ids))
-            assert False
+            # print(self.tokenizer.decode(tokenized["input_ids"][0]))
+            # print(self.tokenizer.decode(header_ids))
 
             input_ids_list = input_ids.tolist()
             num_tokens = attn_mask.sum().item()
@@ -226,6 +228,7 @@ class ARCSolver:
                 "attention_mask": attn_mask.tolist(),
                 "labels": labels.tolist()
             })
+            if len(format_data) % 1000 == 0: print(len(format_data))
         # Q = quantiles(token_lens, n=10)
         # print(min(token_lens), Q, max(token_lens))
         print(f"After truncating, there are {len(format_data)} rows left in the dataset.")
@@ -249,7 +252,7 @@ class ARCSolver:
         
         # create new LoRA finetuning adapter with adapter_name
         lora_config = LoraConfig(
-            r=256, # 8 or 16
+            r=128, # 8 or 16
             lora_alpha=32, # 16 or 32
             # target_modules="all-linear",
             target_modules=[
@@ -268,7 +271,7 @@ class ARCSolver:
         if checkpoint is None: 
             self.model = get_peft_model(self.model, lora_config)
         else: self.model = PeftModel.from_pretrained(self.model, "./artifacts/" + checkpoint, is_trainable=True)
-        
+
         # self.model.to(self.device)
         self.accelerator.prepare(self.model)
         self.model.train()
@@ -279,8 +282,8 @@ class ARCSolver:
         # Create Trainer and start training
         training_args = SFTConfig(
             output_dir=save_directory,
-            per_device_train_batch_size=8, # set smaller when CUDA out of memory
-            gradient_accumulation_steps=4, # set larger when CUDA out of memory
+            per_device_train_batch_size=12, # set smaller when CUDA out of memory
+            gradient_accumulation_steps=3, # set larger when CUDA out of memory
             gradient_checkpointing=True,
             gradient_checkpointing_kwargs={'use_reentrant':False},
             num_train_epochs=1,
@@ -291,10 +294,10 @@ class ARCSolver:
             weight_decay=0.0005,
             fp16=True, # try using bf16
             save_strategy="epoch",
-            logging_steps=50,
+            logging_steps=10,
             remove_unused_columns=False,
             max_seq_length=2048,
-            ddp_find_unused_parameters=False,
+            ddp_find_unused_parameters=True,
             # completion_only_loss=True
         )
         
@@ -359,18 +362,18 @@ class ARCSolver:
         # print(self.tokenizer.decode(output))
 
         # Parse the output
-        try: grid = self.parse_grid(output)
-        except: grid = np.array((1,1))
-
-        # Inverse transformation
-        inv_permu = np.empty_like(self.color_permu)
-        inv_permu[self.color_permu] = np.arange(10)
-        grid = inv_permu[grid]
-        if self.flip != 2: 
-            grid = np.flip(grid, axis=self.flip)
-        # print(grid, self.rot)
-        grid = np.rot90(grid, -self.rot)
-        
+        try: 
+            grid = self.parse_grid(output)
+            # Inverse transformation
+            inv_permu = np.empty_like(self.color_permu)
+            inv_permu[self.color_permu] = np.arange(10)
+            grid = inv_permu[grid]
+            if self.flip != 2: 
+                grid = np.flip(grid, axis=self.flip)
+            # print(grid, self.rot)
+            grid = np.rot90(grid, -self.rot)
+        except: grid = np.zeros((3,3))
+                
         # print(grid)
         return grid
 
