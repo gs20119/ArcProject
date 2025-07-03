@@ -14,7 +14,7 @@ from datasets import Dataset
 from utils import render_grid
 
 # prepare the test dataset
-data_path = "/workspace/dataset"
+data_path = "dataset"
 dataset, task_list = load_data(data_path)
 df300 = sample_data(dataset, task_list, n_row=30000) 
 
@@ -39,20 +39,22 @@ for task_idx in range(300):
         if (wi!=wo) or (hi!=ho): check = False
     if check: simple_tasks.append(task_idx)
     else: hard_tasks.append(task_idx)
-print(hard_tasks)
+
+# print(simple_tasks)
+# print(hard_tasks)
 
 # load our model(arcsolver) instance
 set_seed(1234567890)
 os.environ['NCCL_P2P_DISABLE']='1'
 os.environ['NCCL_IB_DISABLE']='1'
 token = os.environ.get("HF_TOKEN", None)
-solver = ARCSolver(model_id="Qwen/Qwen3-4B", hf_token=token)
+solver = ARCSolver(model_id="Qwen/Qwen3-1.7B", hf_token=token)
 
 # prepare train and then train
 solver.prepare_train()
 # n_train = len(hard_tasks)*700
-n_train = len(simple_tasks)*500
+n_train = 300*100
 n_eval = 500
-dfsimple = sample_data(dataset, task_list, n_row=n_train+n_eval, indices=simple_tasks, random=56)
+dfsimple = sample_data(dataset, task_list, n_row=n_train+n_eval, indices=range(300), random=56)
 train_dataset = Dataset.from_pandas(dfsimple).select(range(n_train))
-solver.train(train_dataset, checkpoint="20250606_053005/checkpoint-final")
+solver.train(train_dataset)

@@ -1,0 +1,5 @@
+
+dataset/
+artifacts/
+__pycache__/
+*.sh
