@@ -124,7 +124,7 @@ class ARCSolver:
         if train:
             output_test_data = transform(test_data['output'])
             assist += output_head + self.format_grid(output_test_data)
-        prompt = sys + user + assist
+        prompt = sys + user + assist + output_head
         return {"input_ids": prompt}
 
 
@@ -299,6 +299,129 @@ class ARCSolver:
         
         # print(grid)
         return grid
+
+    def predict_beam(self, datapoint):
+        """
+        predict with multiple candidates.
+        """
+
+        prompt = self.prompt_id(datapoint)
+        input_ids = torch.tensor(prompt["input_ids"]).to(self.device) # tokenized.input_ids.squeeze().to(self.device)
+        prompt_str = self.tokenizer.decode(input_ids.tolist())
+        input_ids = input_ids.unsqueeze(0)
+        # print(prompt_str)
+
+        config = GenerationConfig(
+            do_sample=False, # greedy sampling
+            pad_token_id=self.tokenizer.pad_token_id,
+            max_new_tokens=512,
+            num_beams=20,
+            num_return_sequences=20,
+            # return_dict_in_generate=True,
+            # output_scores=True
+        )
+
+        # Generate the output
+        N_prompt = input_ids.numel()
+        output = self.model.generate(
+            input_ids=input_ids,
+            generation_config=config,
+        )
+
+        # log_probs = self.model.compute_transition_scores(
+        #     output.sequences, output.scores, normalize_logits=True
+        # ).sum(dim=1)
+        # print(torch.exp(log_probs).cpu().tolist())
+
+        grids = []
+        for seq in output:
+            seq = seq[N_prompt:].tolist()
+            # print(self.tokenizer.decode(seq))
+            try: # Parse the output
+                grid = np.array(self.parse_grid(seq))
+                # Inverse transformation
+                inv_permu = np.empty_like(self.color_permu)
+                inv_permu[self.color_permu] = np.arange(10)
+                grid = inv_permu[grid]
+                if self.flip != 2: 
+                    grid = np.flip(grid, axis=self.flip)
+                # print(grid, self.rot)
+                grid = np.rot90(grid, -self.rot)
+            except: grid = np.zeros((3,3))
+            grids.append(grid)
+            # print(grid)
+        # print(torch.exp(output['sequences_scores']).cpu().tolist())
+        return grids
+
+
+    def predict_bfs(self, datapoint):
+
+        prompt = self.prompt_id(datapoint)
+        input_ids = torch.tensor(prompt["input_ids"]).to(self.device) # tokenized.input_ids.squeeze().to(self.device)
+        prompt_str = self.tokenizer.decode(input_ids.tolist())
+        input_ids = input_ids.unsqueeze(0)
+        # print(prompt_str)
+        
+        # Generate the output
+        N_prompt = input_ids.numel()
+
+        # beams = [(input_ids, 0.0)]
+        beams = input_ids # beams(initially 1) x seqlen
+        scores = torch.tensor([0.0]).to(self.device)
+        eos_id = self.tokenizer.eos_token_id
+        eos = torch.tensor([eos_id]).to(self.device)
+        choices = self.pixel_ids + [self.sep, eos_id]
+        score_threshold = -5.0
+        
+        # bfs candidate search
+        candidates = []
+        for _ in range(512): # max generation token length
+            next_beams = []
+            next_scores = []
+            with torch.no_grad():
+                output = self.model(input_ids=beams)
+            logits = output.logits[:,-1,:] # beams x vocab_size
+            masked_logits = torch.full_like(logits, float('-inf'))
+            masked_logits[:,choices] = logits[:,choices]
+            probs = torch.softmax(masked_logits, dim=-1) # beams x vocab_size
+            logp = torch.log(probs)
+            for i in range(beams.shape[0]):
+                valid = (logp[i]+scores[i]) >= score_threshold # find valid branches (boolean tensor of size vocab_size)
+                if valid[eos_id]:
+                    valid[eos_id] = False
+                    beam_end = torch.cat([beams[i],eos], dim=0).detach().cpu() # add finished candidate
+                    candidates.append(beam_end)
+                next_tokens = torch.nonzero(valid) # valid_tokens x 1
+                if next_tokens.size(0) == 0: break
+                beam_copy = beams[i][None].expand(next_tokens.size(0),-1) # valid_tokens x seqlen
+                next_beams.append(torch.cat([beam_copy, next_tokens], dim=1)) # append: valid_tokens x (seqlen+1)
+                next_scores.append(logp[i][next_tokens]+scores[i]) # append: valid_tokens x 1
+            if not next_beams: break
+            beams = torch.cat(next_beams, dim=0) # new_beams x (seqlen+1)
+            scores = torch.cat(next_scores, dim=0) # new_beams x 1
+            # for beam in beams: print(self.tokenizer.batch_decode(beams))
+            # print(scores)
+        # print(candidates)
+
+        # parse candidates into grid format
+        grids = []
+        for seq in candidates:
+            seq = seq[N_prompt:].tolist()
+            # print(self.tokenizer.decode(seq))
+            try: # Parse the output
+                grid = np.array(self.parse_grid(seq))
+                # Inverse transformation
+                inv_permu = np.empty_like(self.color_permu)
+                inv_permu[self.color_permu] = np.arange(10)
+                grid = inv_permu[grid]
+                if self.flip != 2: 
+                    grid = np.flip(grid, axis=self.flip)
+                # print(grid, self.rot)
+                grid = np.rot90(grid, -self.rot)
+            except: grid = np.zeros((3,3))
+            grids.append(grid)
+            # print(grid)
+        return grids
 
 
     def prepare_evaluation(self, select_adapter=None):
