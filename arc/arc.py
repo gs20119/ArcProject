@@ -253,12 +253,93 @@ class ARCSolver:
         trainer.train()
         trainer.save_model(save_directory + "/checkpoint-final")
 
+    def train_testtime(self, datapoint, size=30):
 
-    def predict(self, datapoint):
+        # prepare testtime train dataset
+        n_sample = len(datapoint['train'])
+        train_dataset = []
+        for _ in range(size):
+            data = {'train':[],'test':[]}
+            permu = self.rng.permutation(n_sample)
+            for i in permu[:-1]:
+                data['train'].append(datapoint['train'][i])
+            data['test'].append(datapoint['train'][permu[-1]])
+            train_dataset.append(data)
+
+        # generate and encode prompts
+        dataset = self.preprocess_data(train_dataset)
+
+        # create new LoRA finetuning adapter
+        lora_config = LoraConfig(
+            r=8, # 8 or 16
+            lora_alpha=16, # 16 or 32
+            target_modules=[
+                "q_proj", "v_proj", "o_proj", "k_proj",
+                "up_proj", "down_proj", "gate_proj"
+            ],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+
+        # replace test time lora adapter 
+        # freeze 'finetuned' adapter
+        self.model.add_adapter(peft_config=lora_config, adapter_name="testtime")
+        self.model.base_model.set_adapter(['finetuned', 'testtime'])
+
+        for name, param in self.model.named_parameters():
+            if "testtime" in name: param.requires_grad = True
+            else: param.requires_grad = False
+        
+        self.model.train()
+        self.model.print_trainable_parameters()
+        if hasattr(self.model, "enable_input_require_grads"):
+            self.model.enable_input_require_grads()
+
+        # create trainer and start training
+        training_args = SFTConfig(
+            per_device_train_batch_size=1, 
+            gradient_accumulation_steps=1,
+            gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={'use_reentrant':False},
+            num_train_epochs=1,
+            learning_rate=1e-4,
+            lr_scheduler_type="cosine", # try using lr scheduler
+            warmup_ratio=0.1,
+            weight_decay=0.0005,
+            fp16=True, # try using bf16
+            save_strategy="epoch",
+            logging_steps=5,
+            remove_unused_columns=False,
+            max_seq_length=2048,
+            ddp_find_unused_parameters=False,
+        )
+
+        def data_collator(features):
+            return {
+                "input_ids": torch.tensor([ f["input_ids"] for f in features ]),
+                "attention_mask": torch.tensor([ f["attention_mask"] for f in features ]),
+                "labels": torch.tensor([ f["labels"] for f in features ])
+            }
+
+        trainer = SFTTrainer(
+            model=self.model, 
+            args=training_args,
+            train_dataset=dataset,
+            data_collator=data_collator
+        )
+        trainer.train()
+        self.model.eval() # ready to predict
+
+
+    def predict(self, datapoint, use_ttt=True):
         """
         A single example of test data is given.
         You should predict 2D grid (List[List[int]] or np.ndarray)
         """
+        if use_ttt: self.model.base_model.set_adapter(['finetuned', 'testtime'])
+        else: self.model.base_model.set_adapter(['finetuned'])
+
         prompt = self.prompt_id(datapoint)
         input_ids = torch.tensor(prompt["input_ids"]).to(self.device) # tokenized.input_ids.squeeze().to(self.device)
         prompt_str = self.tokenizer.decode(input_ids.tolist())
@@ -311,7 +392,7 @@ class ARCSolver:
             print("You did not define adapter path, so we use sample checkpoint instead.")
             adapter_path = "artifacts/checkpoint-final"
         else: adapter_path = "artifacts/" + select_adapter + "/checkpoint-final"
-        self.model = PeftModel.from_pretrained(self.model, adapter_path) # use PeftModel class
+        self.model = PeftModel.from_pretrained(self.model, adapter_path, adapter_name="finetuned") # use PeftModel class
         self.model.eval()
 
     def prepare_train(self):

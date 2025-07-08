@@ -1,5 +1,6 @@
 
 dataset/
 artifacts/
+trainer_output/
 __pycache__/
 *.sh
