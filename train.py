@@ -55,6 +55,6 @@ solver.prepare_train()
 # n_train = len(hard_tasks)*700
 n_train = 300*100
 n_eval = 500
-df = sample_data(dataset, task_list, n_row=n_train+n_eval, indices=range(300), random=56)
+df = sample_data(dataset, task_list, n_row=n_train+n_eval, indices=range(300), random=42)
 train_dataset = Dataset.from_pandas(df).select(range(n_train))
-solver.train(train_dataset)
+solver.train(train_dataset) #, checkpoint="20250709_055605/checkpoint-final")

@@ -190,7 +190,7 @@ class ARCSolver:
         
         # create new LoRA finetuning adapter with adapter_name
         lora_config = LoraConfig(
-            r=16, # 8 or 16
+            r=64, # 8 or 16
             lora_alpha=32, # 16 or 32
             target_modules=[
                 "q_proj", "v_proj", "o_proj", "k_proj",
@@ -309,7 +309,7 @@ class ARCSolver:
             weight_decay=0.0005,
             fp16=True, # try using bf16
             save_strategy="epoch",
-            logging_steps=5,
+            logging_steps=10,
             remove_unused_columns=False,
             max_seq_length=2048,
             ddp_find_unused_parameters=False,
