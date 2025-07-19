@@ -120,10 +120,10 @@ class ARCSolver:
         user += input_head + self.format_grid(input_test_data)
         user += self.tokenizer.encode("\n"+user_message_template3+"\n", add_special_tokens=False) + self.end_tail
         
-        assist = self.assist_header.copy()
+        assist = self.assist_header.copy() + output_head
         if train:
             output_test_data = transform(test_data['output'])
-            assist += output_head + self.format_grid(output_test_data)
+            assist += self.format_grid(output_test_data)
         prompt = sys + user + assist
         return {"input_ids": prompt}
 
@@ -332,7 +332,7 @@ class ARCSolver:
         self.model.eval() # ready to predict
 
 
-    def predict(self, datapoint, use_ttt=True):
+    def predict(self, datapoint, use_ttt=False, return_score=False):
         """
         A single example of test data is given.
         You should predict 2D grid (List[List[int]] or np.ndarray)
@@ -350,6 +350,8 @@ class ARCSolver:
             do_sample=False, # greedy sampling
             pad_token_id=self.tokenizer.pad_token_id,
             max_new_tokens=512,
+            return_dict_in_generate=True,
+            output_scores=True
             # temperature=0.6, # other sampling techs
             # top_k=20,
             # top_p=0.95
@@ -359,15 +361,32 @@ class ARCSolver:
         output = self.model.generate(
             input_ids=input_ids,
             generation_config=config,
-        ).squeeze().cpu()
+        )
         N_prompt = input_ids.numel()
 
-        output = output[N_prompt:].tolist()
-        # print(self.tokenizer.decode(output))
+        output_seq = output.sequences.squeeze().cpu()
+        output_seq = output_seq[N_prompt:].tolist()
+        # print(self.tokenizer.decode(output_seq))
+
+        # compute average logprob (scores)
+        eos_id = self.tokenizer.eos_token_id
+        choices = self.pixel_ids + [self.sep, eos_id]
+        score = 0.0
+        for token, logits in zip(output_seq, output.scores):
+            masked_logits = torch.full_like(logits, float('-inf'))
+            masked_logits[:,choices] = logits[:,choices]
+            probs = torch.softmax(masked_logits, dim=-1)
+            logp = torch.log(probs)
+            score += logp.squeeze()[token].item()
+            # print(self.tokenizer.decode(token))
+            # print(probs[:,choices])
+            # print(logp.squeeze()[token].item())
+        score /= len(output_seq)
+        # print(score)
 
         # Parse the output
         try: 
-            grid = np.array(self.parse_grid(output))
+            grid = np.array(self.parse_grid(output_seq))
             # Inverse transformation
             inv_permu = np.empty_like(self.color_permu)
             inv_permu[self.color_permu] = np.arange(10)
@@ -376,9 +395,12 @@ class ARCSolver:
                 grid = np.flip(grid, axis=self.flip)
             # print(grid, self.rot)
             grid = np.rot90(grid, -self.rot)
-        except: grid = np.zeros((3,3))
+        except: 
+            grid = np.zeros((3,3))
+            score = float('-inf')
         
         # print(grid)
+        if return_score: return grid, score
         return grid
 
 
