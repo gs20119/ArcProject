@@ -1,6 +1,6 @@
 import torch
 from transformers import GenerationConfig, TrainingArguments, Trainer
-from trl import SFTTrainer, SFTConfig
+from trl import SFTTrainer, SFTConfig, GRPOConfig, GRPOTrainer
 from typing import List
 import numpy as np
 
@@ -172,7 +172,7 @@ class ARCSolver:
         print(f"After truncating, there are {len(format_data)} rows left in the dataset.")
         dataset = Dataset.from_list(format_data)
         return dataset
-        
+            
 
     def train(self, train_dataset, adapter_name=None, checkpoint=None):
         """
@@ -252,6 +252,125 @@ class ARCSolver:
         )
         trainer.train()
         trainer.save_model(save_directory + "/checkpoint-final")
+
+
+    def train_rlvr(self, train_dataset, adapter_name=None, checkpoint=None):
+        """ 
+            train the model using RLVR. 
+            recommended to train from checkpoint after original fine-tuning.
+        """
+        # create new LoRA finetuning adapter with adapter_name
+        lora_config = LoraConfig(
+            r=64, # 8 or 16
+            lora_alpha=32, # 16 or 32
+            target_modules=[
+                "q_proj", "v_proj", "o_proj", "k_proj",
+                "up_proj", "down_proj", "gate_proj"
+            ],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        
+        if adapter_name is None: 
+            adapter_name = str(datetime.datetime.now()).split('.')[0].replace(":","").replace("-","").replace(" ","_")
+        save_directory = "./artifacts/" + adapter_name
+
+        if checkpoint is None: 
+            self.model = get_peft_model(self.model, lora_config)
+        else: self.model = PeftModel.from_pretrained(self.model, "./artifacts/" + checkpoint, is_trainable=True)
+        
+        # self.accelerator.prepare(self.model)
+        self.model.train()
+        self.model.print_trainable_parameters()
+        if hasattr(self.model, "enable_input_require_grads"):
+            self.model.enable_input_require_grads()
+
+        # RLVR via GRPO
+        # Define the reward for RL
+        def reward(completions, **kwargs): 
+            generated_tokens = [item["content"] for c in completions for item in c]
+            gt_data = kwargs['test']
+            num_generations = len(completions[0]) 
+            aligned_gts = [
+                np.array(gt['output']) for gt in gt_data for _ in range(num_generations)
+            ]
+
+            rewards = []
+            for i in range(len(generated_tokens)):
+                parse_grid = np.array(self.parse_grid(  
+                    self.tokenizer.encode(generated_tokens[i])
+                ))
+
+                gt_grid = aligned_gts[i]
+
+                if parsed_grid.shape != gt_grid.shape:
+                    reward = 0.0
+                
+                else : 
+                    accuracy = np.sum(parse_grid == gt_grid) / gt_grid.size
+                    #reward = accuracy
+                    reward = 1.0 if accuray == 1.0 else 0.0
+                rewards.append(torch.tensor(reward))
+
+            return rewards
+
+        def formatting_prompts_func(examples):
+            outputs = []
+            for i in range(len(examples['train'])):
+                data_point = {
+                    'train': examples['train'][i],
+                    'test': [examples['test'][i]]
+                }
+                prompt_ids = self.prompt_id(data_point)['input_ids']
+                assist_header_start = self.tokenizer.decode(self.assist_header)
+                prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+                query_text = prompt_text.split(assist_header_start)[0] + assist_header_start
+                outputs.append(query_text)
+            return outputs
+
+        # GRPO trainer 
+
+        # Create Trainer and start training
+        grpo_config = GRPOConfig(
+            output_dir = save_directory,
+            
+            per_device_train_batch_size=2, # set smaller when CUDA out of memory
+            gradient_accumulation_steps=8, # set larger when CUDA out of memory
+            gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={'use_reentrant':False},
+            remove_unused_columns=False,
+
+            num_train_epochs=1,     
+            learning_rate = 1e-5,
+            lr_scheduler_type="cosine",
+            warmup_ratio=0.1,
+            weight_decay=0.0005,
+            fp16=True, 
+
+            max_completion_length=512,
+            num_generations=4,
+            max_prompt_length=2048,
+
+            logging_steps=10,
+            save_strategy="epoch",
+            ddp_find_unused_parameters=False,
+        )
+
+        grpo_trainer = GRPOTrainer(
+            model=self.model,
+            args=grpo_config,
+            tokenizer=self.tokenizer,
+            train_dataset=train_dataset,
+            formatting_func=formatting_prompts_func,
+            reward_func=reward,
+        )
+
+        grpo_trainer.train()
+
+        print("Training finished. Saving model...")
+        grpo_trainer.save_model()
+
 
     def train_testtime(self, datapoint, size=30):
 
