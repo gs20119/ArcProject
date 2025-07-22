@@ -11,6 +11,7 @@ from datasets import Dataset
 import datetime
 
 from accelerate import Accelerator, PartialState
+from .processing import *
 
 class ARCSolver:
     """
@@ -38,7 +39,7 @@ class ARCSolver:
         )
         self.model = None
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, token=hf_token)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.pad_token = self.tokenizer.bos_token
         
         self.system_header = self.tokenizer.encode("<|im_start|>system\n", add_special_tokens=False)
         self.user_header = self.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
@@ -49,6 +50,7 @@ class ARCSolver:
         self.pixel_ids = [ self.tokenizer.encode(str(i), add_special_tokens=False)[0] for i in range(10) ]
         self.sep = self.tokenizer.encode("\n", add_special_tokens=False)[0]
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.processor = MyProcessingClass(self)
 
 
     def parse_grid(self, ids: List[int]):
@@ -85,7 +87,7 @@ class ARCSolver:
         return ids
     
 
-    def prompt_id(self, datapoint, train=False, reasoning=False):
+    def prompt_id(self, datapoint, train=False):
         """
         datapoint (dict): 
             contains training data, test input
@@ -124,22 +126,24 @@ class ARCSolver:
         if train:
             output_test_data = transform(test_data['output'])
             assist += self.format_grid(output_test_data)
+            assist.append(self.tokenizer.eos_token_id)
         prompt = sys + user + assist
         return {"input_ids": prompt}
 
 
-    def preprocess_data(self, train_dataset):
+    def preprocess_data(self, train_dataset, train=True):
         # generate and encode prompts 
         from statistics import quantiles, mean
         format_data = []
         token_lens = []
         for train_data in train_dataset:
-            prompt = self.prompt_id(train_data, train=True)
+            prompt = self.prompt_id(train_data, train=train)
             tokenized = self.tokenizer.pad(
                 prompt, 
                 return_tensors="pt",
                 padding="max_length",
-                max_length=1024
+                max_length=1024,
+                padding_side="left"
             )
             input_ids = tokenized.input_ids.squeeze()
             attn_mask = tokenized.attention_mask.squeeze()
@@ -172,7 +176,6 @@ class ARCSolver:
         print(f"After truncating, there are {len(format_data)} rows left in the dataset.")
         dataset = Dataset.from_list(format_data)
         return dataset
-            
 
     def train(self, train_dataset, adapter_name=None, checkpoint=None):
         """
@@ -260,6 +263,29 @@ class ARCSolver:
             recommended to train from checkpoint after original fine-tuning.
         """
         # create new LoRA finetuning adapter with adapter_name
+        output_head = self.tokenizer.encode("output:\n", add_special_tokens=False)
+        def preprocess_rlvr(encoded):
+            data_point = dict()
+            input_ids = encoded["input_ids"]
+            input_len = len(input_ids)
+            header_len = len(output_head)
+            found = False
+            for i in range(input_len-header_len+1):
+                if input_ids[i:i+header_len] == output_head:
+                    label_idx = i+header_len
+                    found = True
+            if not found: assert False
+            data_point['prompt'] = {
+                "input_ids": [self.tokenizer.pad_token_id]*(input_len-label_idx) + encoded["input_ids"][:label_idx],
+                "attention_mask": [0]*(input_len-label_idx) + encoded["attention_mask"][:label_idx], 
+            }
+            data_point['answer'] = self.tokenizer.decode([i for i in encoded["labels"] if i != -100])[8:-10]
+            return data_point
+
+        encoded = self.preprocess_data(train_dataset)
+        dataset = list(map(preprocess_rlvr, encoded))
+
+        # create new LoRA finetuning adapter with adapter_name
         lora_config = LoraConfig(
             r=64, # 8 or 16
             lora_alpha=32, # 16 or 32
@@ -288,50 +314,17 @@ class ARCSolver:
 
         # RLVR via GRPO
         # Define the reward for RL
-        def reward(completions, **kwargs): 
-            generated_tokens = [item["content"] for c in completions for item in c]
-            gt_data = kwargs['test']
-            num_generations = len(completions[0]) 
-            aligned_gts = [
-                np.array(gt['output']) for gt in gt_data for _ in range(num_generations)
-            ]
-
+        def reward(prompts, completions, answer, **kwargs): 
+            # print(completions)
+            # print(answer)
             rewards = []
-            for i in range(len(generated_tokens)):
-                parse_grid = np.array(self.parse_grid(  
-                    self.tokenizer.encode(generated_tokens[i])
-                ))
-
-                gt_grid = aligned_gts[i]
-
-                if parsed_grid.shape != gt_grid.shape:
-                    reward = 0.0
-                
-                else : 
-                    accuracy = np.sum(parse_grid == gt_grid) / gt_grid.size
-                    #reward = accuracy
-                    reward = 1.0 if accuray == 1.0 else 0.0
-                rewards.append(torch.tensor(reward))
-
+            for c, a in zip(completions, answer):
+                reward = 1.0 if (c == a) else 0.0
+                rewards.append(torch.tensor(reward).to(self.device))
+            # print(rewards)
             return rewards
-
-        def formatting_prompts_func(examples):
-            outputs = []
-            for i in range(len(examples['train'])):
-                data_point = {
-                    'train': examples['train'][i],
-                    'test': [examples['test'][i]]
-                }
-                prompt_ids = self.prompt_id(data_point)['input_ids']
-                assist_header_start = self.tokenizer.decode(self.assist_header)
-                prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
-                query_text = prompt_text.split(assist_header_start)[0] + assist_header_start
-                outputs.append(query_text)
-            return outputs
-
-        # GRPO trainer 
-
-        # Create Trainer and start training
+ 
+        # Create GRPO Trainer and start training
         grpo_config = GRPOConfig(
             output_dir = save_directory,
             
@@ -350,9 +343,9 @@ class ARCSolver:
 
             max_completion_length=512,
             num_generations=4,
-            max_prompt_length=2048,
+            max_prompt_length=1024,
 
-            logging_steps=10,
+            logging_steps=50,
             save_strategy="epoch",
             ddp_find_unused_parameters=False,
         )
@@ -360,10 +353,9 @@ class ARCSolver:
         grpo_trainer = GRPOTrainer(
             model=self.model,
             args=grpo_config,
-            tokenizer=self.tokenizer,
-            train_dataset=train_dataset,
-            formatting_func=formatting_prompts_func,
-            reward_func=reward,
+            train_dataset=dataset,
+            reward_funcs=[reward],
+            processing_class=self.processor
         )
 
         grpo_trainer.train()
