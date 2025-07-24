@@ -12,6 +12,7 @@ import datetime
 
 from accelerate import Accelerator, PartialState
 from .processing import *
+import wandb
 
 class ARCSolver:
     """
@@ -39,7 +40,7 @@ class ARCSolver:
         )
         self.model = None
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, token=hf_token)
-        self.tokenizer.pad_token = self.tokenizer.bos_token
+        self.tokenizer.pad_token = self.tokenizer.eos_token # '-'
         
         self.system_header = self.tokenizer.encode("<|im_start|>system\n", add_special_tokens=False)
         self.user_header = self.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
@@ -143,7 +144,7 @@ class ARCSolver:
                 return_tensors="pt",
                 padding="max_length",
                 max_length=1024,
-                padding_side="left"
+                # padding_side="left"
             )
             input_ids = tokenized.input_ids.squeeze()
             attn_mask = tokenized.attention_mask.squeeze()
@@ -237,6 +238,8 @@ class ARCSolver:
             remove_unused_columns=False,
             max_seq_length=2048,
             ddp_find_unused_parameters=False,
+            report_to = "wandb",
+            run_name = "SFT_experiment",
             # completion_only_loss=True
         )
         
@@ -275,11 +278,15 @@ class ARCSolver:
                     label_idx = i+header_len
                     found = True
             if not found: assert False
-            data_point['prompt'] = {
-                "input_ids": [self.tokenizer.pad_token_id]*(input_len-label_idx) + encoded["input_ids"][:label_idx],
+            # we assume each batch only contains unique, repeated input prompt (length of input_ids will vary for each prompt)
+            # If you don't want this, you need to fine-tune using additional padding token ex. <|pad|>, with left side padding.
+            data_point['prompt'] = { 
+                "input_ids": encoded["input_ids"][:label_idx], 
+                # "input_ids": [self.tokenizer.pad_token_id]*(input_len-label_idx) + encoded["input_ids"][:label_idx],
                 "attention_mask": [0]*(input_len-label_idx) + encoded["attention_mask"][:label_idx], 
             }
-            data_point['answer'] = self.tokenizer.decode([i for i in encoded["labels"] if i != -100])[8:-10]
+            data_point['answer'] = self.tokenizer.decode(
+                [i for i in encoded["labels"] if i not in [-100, self.tokenizer.eos_token_id]])[8:]
             return data_point
 
         encoded = self.preprocess_data(train_dataset)
@@ -314,20 +321,33 @@ class ARCSolver:
 
         # RLVR via GRPO
         # Define the reward for RL
+        table = wandb.Table(columns=["answer", "sample completion", "mean reward"], log_mode="MUTABLE")
         def reward(prompts, completions, answer, **kwargs): 
-            # print(completions)
-            # print(answer)
+            # print(self.tokenizer.decode(prompts[0]["input_ids"]))
             rewards = []
             for c, a in zip(completions, answer):
-                reward = 1.0 if (c == a) else 0.0
-                rewards.append(torch.tensor(reward).to(self.device))
-            # print(rewards)
-            return rewards
+                csp = c.splitlines()
+                asp = a.splitlines()
+                check = len(asp) == len(csp) # format check
+                if check: check = all(len(ci) == len(ai) for ci, ai in zip(csp, asp))
+                reward = 0.0 if check else -1.0
+                if check: 
+                    acc = sum(1.0 for i in range(len(a)) if c[i] == a[i]) / len(a)
+                    row_acc = sum(ci == ai for ci, ai in zip(csp, asp)) / len(csp)
+                    col_acc = sum(
+                        [ai[j] for ai in asp] == [ci[j] for ci in csp] 
+                        for j in range(len(asp[0]))
+                    ) / len(asp[0])
+                    reward += 0.5*(acc+row_acc+col_acc)
+                    if reward == 1.5: reward += 0.5 # +0.5 if everything is correct
+                rewards.append(reward)
+            table.add_data(answer[0], completions[0], np.mean(rewards))
+            wandb.log({"train_samples": table})
+            return torch.tensor(rewards).to(self.device)
  
         # Create GRPO Trainer and start training
         grpo_config = GRPOConfig(
             output_dir = save_directory,
-            
             per_device_train_batch_size=2, # set smaller when CUDA out of memory
             gradient_accumulation_steps=8, # set larger when CUDA out of memory
             gradient_checkpointing=True,
@@ -337,17 +357,24 @@ class ARCSolver:
             num_train_epochs=1,     
             learning_rate = 1e-5,
             lr_scheduler_type="cosine",
-            warmup_ratio=0.1,
+            warmup_ratio=0.05,
             weight_decay=0.0005,
             fp16=True, 
+            beta=0.01,
+            loss_type="dr_grpo",
 
-            max_completion_length=512,
-            num_generations=4,
+            temperature=0.7, # tight temperature
+            top_p=0.95,
+            top_k=5,
+            max_completion_length=256,
+            num_generations=16, # It MUST BE per_dev_batchsize x accumulation_steps
             max_prompt_length=1024,
 
-            logging_steps=50,
+            logging_steps=10,
             save_strategy="epoch",
             ddp_find_unused_parameters=False,
+            report_to = "wandb",
+            run_name = "RLVR_experiment"
         )
 
         grpo_trainer = GRPOTrainer(
@@ -357,7 +384,10 @@ class ARCSolver:
             reward_funcs=[reward],
             processing_class=self.processor
         )
-
+        eos_id = self.tokenizer.eos_token_id
+        choices = self.pixel_ids + [self.sep, eos_id]
+        suppress_ids = [i for i in range(self.tokenizer.vocab_size) if i not in choices]
+        grpo_trainer.model.generation_config.suppress_tokens = suppress_ids
         grpo_trainer.train()
 
         print("Training finished. Saving model...")

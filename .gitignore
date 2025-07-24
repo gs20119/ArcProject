@@ -2,5 +2,6 @@
 dataset/
 artifacts/
 trainer_output/
+wandb/
 __pycache__/
 *.sh
